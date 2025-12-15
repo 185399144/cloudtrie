@@ -1,0 +1,20 @@
+# Python version: 3.8+
+
+# Core dependencies
+chardet>=4.0.0
+
+# Standard library modules (included with Python)
+# - json
+# - pickle
+# - statistics
+# - random
+# - math
+# - datetime
+# - pathlib
+# - argparse
+# - collections
+# - ipaddress
+# - re
+# - gzip
+# - csv
+# - lzma
