@@ -278,11 +278,6 @@ def build_single_trie(rib_group, roa_group, irr_folder, bgpdump_path=None):
         trie = build_trie_from_irr(irr_folder, trie)
     return trie
 
-
-# ============================================================
-# 以下是从 build_iptrie_real.py 整合的内容
-# ============================================================
-
 import gzip
 
 
@@ -354,3 +349,4 @@ def build_iptrie_from_real_data(rib_file=None, roa_dir=None, irr_dir=None, bgpdu
             print(f"Warning: IRR directory not found: {irr_dir}")
 
     return trie
+
