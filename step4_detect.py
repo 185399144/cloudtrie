@@ -18,7 +18,7 @@ from pathlib import Path
 
 from cloud_uncertainty import DEFAULT_TH_PRO, calculate_uncertainty, load_json, save_json
 from detecttrie import DetectTrie
-from iptrie import IPTrie, ip_prefix_to_bits, normalize_asn
+from iptrie import IPTrie, clean_as_path, ip_prefix_to_bits, normalize_asn
 
 
 class OnlineDetector:
@@ -37,7 +37,7 @@ class OnlineDetector:
         self.cloud_params = cloud_params
         self.th_pro = float(th_pro)
         self.th_update = int(th_update)
-        self.pending_updates = {}  # (prefix_bits, origin_asn) -> True
+        self.pending_updates = {}
         self.lazy_flushes = 0
         self.accepted_new_pairs = 0
 
@@ -52,12 +52,25 @@ class OnlineDetector:
         self.lazy_flushes += 1
         return count
 
-    def classify_update(self, prefix: str, origin_asn, as_path=None) -> dict:
+    def _queue_lazy_update(self, bits: str, origin: int) -> None:
+        if (bits, origin) not in self.pending_updates:
+            self.pending_updates[(bits, origin)] = True
+            self.accepted_new_pairs += 1
+            if len(self.pending_updates) > self.th_update:
+                self.flush_pending()
+
+    def classify_update(self, prefix: str, origin_asn=None, as_path=None) -> dict:
         """Classify a single BGP announcement and apply online lazy update rules."""
         bits = ip_prefix_to_bits(prefix)
-        origin = normalize_asn(origin_asn)
+        if origin_asn is None and as_path:
+            paths = clean_as_path(as_path)
+            if not paths:
+                raise ValueError(f"Unable to extract origin ASN from as_path={as_path!r}")
+            origin = paths[0][-1]
+        else:
+            origin = normalize_asn(origin_asn)
 
-        # Fast path: exact match already trusted in DetectTrie or pending lazy insertion
+        # Fast path: exact match already trusted in DetectTrie or pending lazy buffer
         exact_set = self.detect_trie.search(bits)
         if (exact_set and origin in exact_set) or (bits, origin) in self.pending_updates:
             return {
@@ -70,6 +83,19 @@ class OnlineDetector:
                 "certainty": None,
             }
 
+        # RFC 6811 Cover / Match lookup in DetectTrie
+        status, expected_set, matched_len = self.detect_trie.classify(bits, origin)
+        if status == "valid":
+            return {
+                "prefix": prefix,
+                "origin": origin,
+                "status": "valid",
+                "matched_prefix_len": matched_len,
+                "expected_origins": sorted(expected_set),
+                "uncertainty": None,
+                "certainty": None,
+            }
+
         unc_info = None
         if self.model_trie is not None and self.cloud_params is not None:
             live_po = self.model_trie.evaluate_live_pair(
@@ -77,15 +103,14 @@ class OnlineDetector:
             )
             unc_info = calculate_uncertainty(live_po, self.cloud_params, stochastic=False)
             if unc_info["total_uncertainty"] < self.th_pro:
-                self.pending_updates[(bits, origin)] = True
-                self.accepted_new_pairs += 1
-                if len(self.pending_updates) > self.th_update:
-                    self.flush_pending()
+                self._queue_lazy_update(bits, origin)
                 return {
                     "prefix": prefix,
                     "origin": origin,
-                    "status": "valid",
-                    "accepted_as_new": True,
+                    "status": "not_found" if status == "not_found" else "valid",
+                    "accepted_for_update": True,
+                    "matched_prefix_len": matched_len,
+                    "expected_origins": sorted(expected_set),
                     "uncertainty": round(unc_info["total_uncertainty"], 6),
                     "certainty": round(unc_info["certainty"], 6),
                     "deviations": {
@@ -95,7 +120,6 @@ class OnlineDetector:
                     },
                 }
 
-        status, expected_set, matched_len = self.detect_trie.classify(bits, origin)
         result = {
             "prefix": prefix,
             "origin": origin,
@@ -117,7 +141,7 @@ class OnlineDetector:
 
 
 def classify_update(detect_trie: DetectTrie, prefix: str, origin_asn):
-    """Lightweight DetectTrie-only classification helper (backward compatible)."""
+    """DetectTrie-only classification helper."""
     bits = ip_prefix_to_bits(prefix)
     status, expected_set, _ = detect_trie.classify(bits, normalize_asn(origin_asn))
     return status, sorted(expected_set) if expected_set else None
@@ -218,7 +242,7 @@ def main():
     for u in updates:
         try:
             res = detector.classify_update(
-                u["prefix"], u["origin"], as_path=u.get("as_path")
+                u["prefix"], u.get("origin"), as_path=u.get("as_path")
             )
             results.append(res)
             u_str = f" u={res['uncertainty']:.4f}" if res.get("uncertainty") is not None else ""

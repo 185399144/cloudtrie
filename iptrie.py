@@ -150,7 +150,7 @@ def default_temporal_weights(window_days: int = DEFAULT_WINDOW_DAYS):
 
 
 class TrieNode:
-    """Node in ModelTrie (IPTrie) storing per-prefix BGP, RPKI, and IRR evidence."""
+    """Node in ModelTrie (IPTrie) storing per-prefix routing evidence and scores."""
 
     __slots__ = (
         "children",
@@ -161,23 +161,23 @@ class TrieNode:
         "roa_records",
         "irr_origins",
         "sources",
+        "features",
+        "competing_origins",
+        "uncertainties",
     )
 
     def __init__(self):
         self.children = {"0": None, "1": None}
         self.is_end_of_prefix = False
-        # origin_asn -> set of datetime.date (or int day indices) observed in BGP RIB
         self.rib_dates = defaultdict(set)
-        # origin_asn -> set of peer ASNs observing this (prefix, origin)
         self.rib_peers = defaultdict(set)
-        # origin_asn -> set of direct upstream / transit ASNs on observed BGP paths
         self.rib_upstreams = defaultdict(set)
-        # set of (origin_asn, max_length) from RPKI ROAs
         self.roa_records = set()
-        # set of origin_asn from IRR route/route6 objects
         self.irr_origins = set()
-        # origin_asn -> set of data source tags ('RIB', 'RPKI', 'IRR')
         self.sources = defaultdict(set)
+        self.features = {}
+        self.competing_origins = {}
+        self.uncertainties = {}
 
 
 class IPTrie:
@@ -396,9 +396,12 @@ class IPTrie:
                 stack.append((bits + "0", c0))
         return out
 
-    def _ref_origins_at(self, node: TrieNode):
-        """Reference origins at a node: BGP RIB origins union non-zero RPKI ROA origins."""
-        refs = set(node.rib_dates.keys())
+    def _ref_origins_at(self, node: TrieNode, latest_date=None):
+        """Reference origins at a node: active BGP RIB origins union non-zero RPKI ROA origins."""
+        refs = set()
+        for origin, dates in node.rib_dates.items():
+            if latest_date is None or self._compute_hbits(dates, latest_date, self.window_days) > 0:
+                refs.add(origin)
         for roa_asn, _ in node.roa_records:
             if roa_asn > 0:
                 refs.add(roa_asn)
@@ -443,13 +446,13 @@ class IPTrie:
             return 0.3
         return 0.0
 
-    def _rpki_irr_and_competitors(self, prefix_bits: str, origin: int):
+    def _rpki_irr_and_competitors(self, prefix_bits: str, origin: int, latest_date=None):
         """Evaluate RFC 6811 RPKI status, IRR presence, and covering competing origins."""
         plen = len(prefix_bits)
         roa_covered = False
         roa_valid = False
         irr_valid = False
-        comp_space = {}  # comp_asn -> bool (whether origin has SPACE hit at that covering node)
+        comp_space = {}
 
         for depth, sub_bits, node in self._walk_covering(prefix_bits):
             if node.roa_records:
@@ -461,7 +464,7 @@ class IPTrie:
                 if origin in node.irr_origins:
                     irr_valid = True
             if depth >= self.min_prefix_len:
-                refs = self._ref_origins_at(node)
+                refs = self._ref_origins_at(node, latest_date=latest_date)
                 if refs:
                     sp_hit = (sub_bits, origin) in self.space_set
                     for c in refs:
@@ -472,6 +475,10 @@ class IPTrie:
         k1 = 1 if roa_valid else (-1 if roa_covered else 0)
         k2 = 0 if k1 == -1 else (1 if irr_valid else 0)
         return k1, k2, comp_space
+
+    def _latest_rib_date(self):
+        real_dates = [d for d in self.observed_dates if isinstance(d, datetime.date)]
+        return max(real_dates) if real_dates else None
 
     def _compute_hbits(self, dates_set, latest_date, window_days: int) -> int:
         """Build d-bit persistence bitmask (bit 0 = newest day, bit d-1 = oldest day)."""
@@ -489,8 +496,8 @@ class IPTrie:
                 hbits |= 1 << offset
         return hbits
 
-    def _build_space_and_origin_counts(self, prefix_nodes):
-        """Populate space_set (delegation evidence) and N(o) over active BGP pairs."""
+    def _build_space_and_origin_counts(self, prefix_nodes, latest_date=None):
+        """Populate space_set and N(o) over active BGP pairs within the observation window."""
         self.space_set.clear()
         self.origin_n_pfx.clear()
         self.origin_q_pfx.clear()
@@ -499,23 +506,23 @@ class IPTrie:
             plen = len(prefix_bits)
             if not node.rib_dates:
                 continue
-            for origin in node.rib_dates:
+            for origin, dates in node.rib_dates.items():
+                if self._compute_hbits(dates, latest_date, self.window_days) == 0:
+                    continue
                 self.origin_n_pfx[origin] += 1
-                # Mark strictly shorter covering ancestors that have any ref origin != origin
                 for depth, sub_bits, anc_node in self._walk_covering(prefix_bits):
                     if depth < self.min_prefix_len or depth >= plen:
                         continue
-                    refs = self._ref_origins_at(anc_node)
+                    refs = self._ref_origins_at(anc_node, latest_date=latest_date)
                     if refs and (len(refs) > 1 or origin not in refs):
                         self.space_set.add((sub_bits, origin))
 
     def collect_po_pairs(self, source_weights=DEFAULT_SOURCE_WEIGHTS):
         """Extract normalized [0, 1] features (s^t, s^r, s^m) for every P/O pair in ModelTrie."""
         prefix_nodes = self.iter_prefix_nodes()
-        self._build_space_and_origin_counts(prefix_nodes)
+        latest_date = self._latest_rib_date()
+        self._build_space_and_origin_counts(prefix_nodes, latest_date=latest_date)
 
-        real_dates = [d for d in self.observed_dates if isinstance(d, datetime.date)]
-        latest_date = max(real_dates) if real_dates else None
         w_t = default_temporal_weights(self.window_days)
         w_t_sum = sum(w_t)
         w1, w2 = float(source_weights[0]), float(source_weights[1])
@@ -524,7 +531,6 @@ class IPTrie:
         self._rib_pair_hbits.clear()
         self._online_seen_new.clear()
 
-        # Pass 1: compute s^t, s^m, competing-origin score rho, and accumulate Q(o).
         intermediate = []
         for prefix_bits, node in prefix_nodes:
             all_origins = set(node.sources.keys()) | set(node.rib_dates.keys()) | set(node.irr_origins)
@@ -533,23 +539,20 @@ class IPTrie:
                     all_origins.add(roa_asn)
 
             for origin in sorted(all_origins):
-                has_rib = origin in node.rib_dates and len(node.rib_dates[origin]) > 0
-                hbits = self._compute_hbits(node.rib_dates.get(origin), latest_date, self.window_days) if has_rib else 0
+                hbits = self._compute_hbits(node.rib_dates.get(origin), latest_date, self.window_days)
+                has_rib = hbits > 0
                 if has_rib:
                     self._rib_pair_hbits[(prefix_bits, origin)] = hbits
 
-                # Temporal persistence s^t in [0, 1] (Eq. 2)
                 h_vec = [(hbits >> j) & 1 for j in range(self.window_days)]
                 s_t = sum(h * w for h, w in zip(h_vec, w_t)) / w_t_sum
 
-                # RPKI / IRR validation & competing origins
-                k1, k2, comp_space = self._rpki_irr_and_competitors(prefix_bits, origin)
+                k1, k2, comp_space = self._rpki_irr_and_competitors(
+                    prefix_bits, origin, latest_date=latest_date
+                )
                 has_comp = bool(comp_space)
-
-                # Data source score s^m in [0, 1] (Eq. 4)
                 s_m = 0.5 + (w1 * k1 + w2 * k2) / (2.0 * (w1 + w2))
 
-                # Relationship closeness max_c rho(o, c)
                 ups_o = node.rib_upstreams.get(origin, ())
                 if not comp_space:
                     best_rho = 1.0
@@ -570,12 +573,16 @@ class IPTrie:
                 sources = set(node.sources.get(origin, ()))
                 if has_rib:
                     sources.add("RIB")
+                else:
+                    sources.discard("RIB")
                 if k1 == 1:
                     sources.add("RPKI")
                 if origin in node.irr_origins:
                     sources.add("IRR")
 
+                node.competing_origins[origin] = sorted(comp_space.keys())
                 intermediate.append((
+                    node,
                     prefix_bits,
                     origin,
                     sorted(sources),
@@ -593,9 +600,9 @@ class IPTrie:
                     is_unrelated,
                 ))
 
-        # Pass 2: finalize origin consistency O(o) = 1 - Q(o)/N(o) and s^r (Eq. 3).
         po_list = []
         for (
+            node,
             prefix_bits,
             origin,
             sources,
@@ -617,6 +624,7 @@ class IPTrie:
             o_score = (1.0 - q_o / float(n_o)) if n_o > 0 else (0.0 if is_unrelated else 1.0)
             s_r = min(rho_eff, o_score) if has_rib else 0.0
 
+            node.features[origin] = (float(s_t), float(s_r), float(s_m))
             po_list.append({
                 "prefix": bits_to_ip_prefix(prefix_bits, self.ip_version),
                 "prefix_bits": prefix_bits,
@@ -638,6 +646,19 @@ class IPTrie:
             })
 
         return po_list
+
+    def record_uncertainties(self, scored_pairs):
+        """Store computed P/O uncertainty degrees on the corresponding ModelTrie nodes."""
+        for item in scored_pairs:
+            prefix_bits = item["prefix_bits"]
+            origin = int(item["origin"])
+            node = self.root
+            for bit in prefix_bits:
+                node = node.children.get(bit)
+                if node is None:
+                    break
+            if node is not None:
+                node.uncertainties[origin] = float(item["total_uncertainty"])
 
     def evaluate_live_pair(
         self,
@@ -683,7 +704,10 @@ class IPTrie:
         if exact_node is not None:
             ups_live |= exact_node.rib_upstreams.get(origin, set())
 
-        k1, k2, comp_space = self._rpki_irr_and_competitors(prefix_bits, origin)
+        latest_date = self._latest_rib_date()
+        k1, k2, comp_space = self._rpki_irr_and_competitors(
+            prefix_bits, origin, latest_date=latest_date
+        )
         has_comp = bool(comp_space)
         s_m = 0.5 + (w1 * k1 + w2 * k2) / (2.0 * (w1 + w2))
 
@@ -727,3 +751,6 @@ class IPTrie:
             "origin_consistency": float(o_score),
             "competing_origins": sorted(comp_space.keys()),
         }
+
+
+ModelTrie = IPTrie

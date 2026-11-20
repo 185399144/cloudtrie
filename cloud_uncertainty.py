@@ -62,7 +62,7 @@ def compute_cloud_params(po_pairs, en_m: float = DEFAULT_SOURCE_EN):
     Anchor selection:
       - time (s^t): BGP-observed pairs without competing origins.
       - space (s^r): BGP-observed pairs with competing origins observed across the
-        full d-day window (with graceful fallback for single-day or tiny datasets).
+        full d-day observation window.
       - source (s^m): fixed gate Ex_m = 0.5, En_m = en_m, He_m = 0.0.
     """
     rib_pairs = [po for po in po_pairs if po.get("has_rib")]
@@ -83,13 +83,6 @@ def compute_cloud_params(po_pairs, en_m: float = DEFAULT_SOURCE_EN):
     if not anchor_r:
         anchor_r = [float(po["space_consistency"]) for po in rib_pairs]
 
-    # Empirical source distribution recorded in metadata for descriptive reference only
-    emp_m_vals = [
-        float(po["source_consistency"])
-        for po in po_pairs
-        if po.get("has_rib") or po.get("rpki_status") == 1
-    ]
-
     params = {
         "time": estimate_cloud_params(anchor_t),
         "space": estimate_cloud_params(anchor_r),
@@ -104,7 +97,6 @@ def compute_cloud_params(po_pairs, en_m: float = DEFAULT_SOURCE_EN):
             "n_rib": int(len(rib_pairs)),
             "n_anchor_time": int(len(anchor_t)),
             "n_anchor_space": int(len(anchor_r)),
-            "empirical_source_cloud": estimate_cloud_params(emp_m_vals) if emp_m_vals else None,
         },
     }
     return params

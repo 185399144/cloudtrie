@@ -61,7 +61,7 @@ python step4_detect.py \
   --th-update 100
 ```
 
-> **Note:** `--as-rel`, `--as-org`, `--roa-dir`, and `--irr-dir` are optional when partial data sources are used; IPv4 and IPv6 are modeled independently via `--ip-version 4` or `--ip-version 6`.
+> **Note:** `--as-rel`, `--as-org`, `--roa-dir`, and `--irr-dir` are optional when partial data sources are used. When directories contain multiple dated snapshots, pass `--end-date YYYYMMDD` (or let Step 1 align automatically to the latest RIB date) to select the corresponding $d$-day window.
 
 ## Data Sources & Preprocessing
 
@@ -112,6 +112,7 @@ Incoming updates `(prefix, origin[, as_path])` are checked against `DetectTrie` 
 | `--as-rel` | CAIDA AS relationships file or directory | No |
 | `--as-org` | CAIDA AS2Org file or directory | No |
 | `--window-days` | Sliding window length $d$ (default `5`) | No |
+| `--end-date` | Window end date `YYYYMMDD` (defaults to latest RIB date) | No |
 | `--ip-version` | `4` or `6` (default `4`) | No |
 | `--bgpdump` | Path to `bgpdump` binary | No |
 | `--output` | Output path for `ModelTrie` (default `./IPtrie/iptrie.dat`) | No |

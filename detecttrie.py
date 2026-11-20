@@ -44,7 +44,7 @@ class DetectTrie:
         node.source_as_set.add(origin)
 
     def log_conflict(self, prefix: str, existing_as, new_as: int) -> None:
-        """Record multi-origin (MOAS) prefixes for auditability."""
+        """Record multi-origin (MOAS) prefixes."""
         self.conflict_log[prefix].update(existing_as)
         self.conflict_log[prefix].add(new_as)
 
@@ -115,7 +115,7 @@ class DetectTrie:
 
     @staticmethod
     def load(file_path):
-        """Load DetectTrie from disk (backward-compatible with legacy root-only pickles)."""
+        """Load DetectTrie from disk."""
         with Path(file_path).open("rb") as f:
             payload = pickle.load(f)
         trie = DetectTrie()

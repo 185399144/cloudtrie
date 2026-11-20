@@ -55,11 +55,17 @@ def main():
         help="Observation window length d in days (default: 5)",
     )
     parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Window end date YYYYMMDD (defaults to latest RIB snapshot date)",
+    )
+    parser.add_argument(
         "--ip-version",
         type=int,
         choices=(4, 6),
         default=4,
-        help="IP protocol version to model (4 or 6, built independently; default: 4)",
+        help="IP protocol version (4 or 6; default: 4)",
     )
     parser.add_argument(
         "--bgpdump",
@@ -84,6 +90,7 @@ def main():
         as_org_path=args.as_org,
         bgpdump_path=args.bgpdump,
         window_days=args.window_days,
+        end_date=args.end_date,
         ip_version=args.ip_version,
     )
 

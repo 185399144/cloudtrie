@@ -45,6 +45,7 @@ def compute_uncertainty_for_trie(
         item["total_uncertainty"] = round(unc_info["total_uncertainty"], 6)
         scored.append(item)
 
+    trie.record_uncertainties(scored)
     return cloud_params, scored
 
 
@@ -105,6 +106,7 @@ def main():
     scored_path = out_dir / "po_scores.json"
     save_json(cloud_params, params_path)
     save_json(scored, scored_path)
+    trie.save_to_file(args.iptrie)
 
     print(f"Cloud params saved to: {params_path}")
     print(f"P/O scores saved to: {scored_path}")
