@@ -1,352 +1,418 @@
+"""Data collection and preprocessing for building ModelTrie (IPTrie).
+
+Parses:
+  - BGP RIB snapshots (MRT via bgpdump or pre-parsed pipe-delimited files)
+  - RPKI ROAs (CSV / .csv.xz / TSV with maxLength for RFC 6811 validation)
+  - IRR route/route6 objects (RPSL text / .gz / TSV)
+  - CAIDA AS relationships (as-rel2.txt / .bz2 / .gz)
+  - CAIDA AS-to-Organization mappings (as-org2info.txt.gz / .txt / TSV)
+"""
+
+import bz2
+import csv
+import datetime as dt
+import gzip
+import ipaddress
+import lzma
 import os
 import re
+import shutil
 import subprocess
-import ipaddress
-import datetime
-import chardet
-from io import StringIO
-from pathlib import Path
 from collections import defaultdict
-
-from iptrie import IPTrie
-
-PANDAS_AVAILABLE = False
-DATEUTIL_AVAILABLE = False
+from pathlib import Path
 
 try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
-except Exception as e:
-    print(f"Warning: pandas import failed: {e}")
+    import chardet
+except ImportError:
+    chardet = None
 
-try:
-    from dateutil import parser
-    DATEUTIL_AVAILABLE = True
-except Exception as e:
-    print(f"Warning: dateutil import failed: {e}")
+from iptrie import (
+    DEFAULT_WINDOW_DAYS,
+    IPTrie,
+    clean_as_path,
+    extract_org_stem,
+    ip_prefix_to_bits,
+    is_private_asn,
+    normalize_asn,
+)
 
 
-def normalize_asn(asn):
-    return re.sub(r'^AS', '', str(asn))
-
-
-def extract_date_generic(filename):
-    import datetime as dt
-    date_candidates = re.findall(r'\d{4}[-_]\d{1,2}[-_]\d{1,2}|\d{8}', filename)
-    if date_candidates:
-        for date_str in date_candidates:
-            normalized_date = date_str.replace('_', '-').replace('-', '')
+def extract_date_generic(filename: str):
+    """Extract YYYY-MM-DD / YYYYMMDD date from a filename, or return None."""
+    name = os.path.basename(str(filename))
+    candidates = re.findall(r"\d{4}[-_]\d{1,2}[-_]\d{1,2}|\d{8}", name)
+    for token in candidates:
+        digits = token.replace("_", "-").replace("-", "")
+        if len(digits) == 8:
             try:
-                if len(normalized_date) == 8:
-                    year = int(normalized_date[:4])
-                    month = int(normalized_date[4:6])
-                    day = int(normalized_date[6:8])
-                    return dt.date(year, month, day)
-            except (ValueError, TypeError):
+                return dt.date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+            except ValueError:
                 continue
     return None
 
 
-def load_ribs_to_df(fpath, bgpdump_path=None):
+def _open_text(file_path, encoding="utf-8"):
+    """Open plain, .gz, .bz2, or .xz text file transparently."""
+    p = str(file_path)
+    if p.endswith(".gz"):
+        return gzip.open(p, "rt", encoding=encoding, errors="ignore")
+    if p.endswith(".bz2"):
+        return bz2.open(p, "rt", encoding=encoding, errors="ignore")
+    if p.endswith(".xz"):
+        return lzma.open(p, "rt", encoding=encoding, errors="ignore")
+    return open(p, "r", encoding=encoding, errors="ignore")
+
+
+def _detect_encoding(file_path) -> str:
+    p = str(file_path)
+    if p.endswith((".gz", ".bz2", ".xz")) or chardet is None:
+        return "utf-8"
+    with open(p, "rb") as f:
+        sample = f.read(2048)
+    detected = chardet.detect(sample)
+    return detected.get("encoding") or "utf-8"
+
+
+def _resolve_bgpdump(bgpdump_path=None) -> str:
+    if bgpdump_path:
+        return str(bgpdump_path)
+    found = shutil.which("bgpdump")
+    return found if found else "bgpdump"
+
+
+def _prefix_matches_version(prefix: str, ip_version: int) -> bool:
     try:
-        if bgpdump_path is None:
-            bgpdump_path = "/mnt/data/bgpd/bgpdump"
-        
-        res = subprocess.check_output([bgpdump_path, "-q", "-m", "-u", str(fpath)]).decode()
-        fmt = "type|timestamp|A/W|peer-ip|peer-asn|prefix|as-path|origin-protocol|next-hop|local-pref|MED|community|atomic-agg|aggregator|unknown-field-1|unknown-field-2"
-        cols = fmt.split("|")
-        cols_needed = ["prefix", "as-path", "peer-asn"]
-        col_indices = [cols.index(c) for c in cols_needed]
-
-        rows = []
-        for line in res.strip().split('\n'):
-            if not line:
-                continue
-            parts = line.split('|')
-            row = {cols_needed[i]: parts[col_indices[i]] for i in range(len(cols_needed))}
-            rows.append(row)
-        return rows
-    except Exception as e:
-        print(f"Error processing file {fpath}: {e}")
-        return None
+        net = ipaddress.ip_network(prefix, strict=False)
+        return net.version == ip_version
+    except ValueError:
+        return False
 
 
-def build_trie_from_ribs(file_group, trie, bgpdump_path=None):
-    total_prefixes = 0
-    for files in file_group:
-        for file_path in files:
-            print(f"Processing RIB file: {file_path}")
-            rows = load_ribs_to_df(file_path, bgpdump_path=bgpdump_path)
+def iter_rib_records(fpath, bgpdump_path=None):
+    """Stream (prefix, as_path, peer_asn) tuples from an MRT RIB or bgpdump-m text file."""
+    path_str = str(fpath)
+    # Plain pipe-delimited bgpdump -m output (e.g. .txt / .tsv / .dump)
+    if path_str.endswith((".txt", ".tsv", ".dump", ".csv")):
+        with _open_text(path_str) as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("|")
+                if len(parts) >= 7:
+                    yield parts[5], parts[6], parts[4]
+        return
 
-            if rows is None or len(rows) == 0:
-                print(f"Skipping file {file_path} due to error or empty data.")
-                continue
+    bgpdump = _resolve_bgpdump(bgpdump_path)
+    proc = subprocess.Popen(
+        [bgpdump, "-q", "-m", "-u", path_str],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="ignore",
+    )
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            parts = line.rstrip("\n").split("|")
+            if len(parts) >= 7:
+                yield parts[5], parts[6], parts[4]
+    finally:
+        proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"bgpdump exited with code {rc} on {path_str}")
 
-            date_from_file = extract_date_generic(file_path)
 
-            for row in rows:
-                prefix = row['prefix']
-                as_path = row['as-path']
-                peer_as = row['peer-asn']
-                source_as = None
-
-                if as_path and as_path != '-':
-                    as_path_list = as_path.split()
-                    source_as = as_path_list[-1] if as_path_list else None
-
-                if source_as:
-                    try:
-                        source_as = normalize_asn(source_as)
-                        ip_network = ipaddress.ip_network(prefix, strict=False)
-                        if isinstance(ip_network.network_address, ipaddress.IPv4Address):
-                            prefix_length = ip_network.prefixlen
-                            ip_prefix = ''.join(format(int(octet), '08b') for octet in ip_network.network_address.packed)
-                            ip_prefix = ip_prefix[:prefix_length]
-
-                            announced = True
-                            trie.insert(ip_prefix, source_as, 'RIB', announced, date_from_file, peer_as)
-                            total_prefixes += 1
-
-                    except ValueError:
-                        pass
-
-    print(f"Processed {len(file_group)} RIB files, total prefixes: {total_prefixes}")
+def build_trie_from_ribs(rib_files, trie: IPTrie, bgpdump_path=None, ip_version: int = 4):
+    """Parse one or more RIB files into ModelTrie with AS-path cleaning."""
+    total_records = 0
+    for fpath in rib_files:
+        fpath_str = str(fpath)
+        print(f"Processing RIB file: {fpath_str}")
+        date_from_file = extract_date_generic(fpath_str)
+        try:
+            for prefix, as_path, peer_as in iter_rib_records(fpath_str, bgpdump_path=bgpdump_path):
+                if not _prefix_matches_version(prefix, ip_version):
+                    continue
+                paths = clean_as_path(as_path)
+                if not paths:
+                    continue
+                prefix_bits = ip_prefix_to_bits(prefix)
+                for path in paths:
+                    origin = path[-1]
+                    upstream = path[-2] if len(path) >= 2 else None
+                    trie.insert(
+                        prefix_bits,
+                        origin,
+                        "RIB",
+                        announced=True,
+                        date=date_from_file,
+                        peer_as=peer_as,
+                        upstream_as=upstream,
+                    )
+                    total_records += 1
+        except Exception as exc:
+            print(f"Warning: failed to process RIB file {fpath_str}: {exc}")
+    print(f"Processed {len(rib_files)} RIB file(s), total cleaned records: {total_records}")
     return trie
 
 
-def build_trie_from_roas(file_group, trie):
-    import lzma
-    import csv
-    
-    prefix_count = 0
-    for files in file_group:
-        for file_path in files:
-            print(f"Processing ROA file: {file_path}")
-
-            if not isinstance(file_path, str):
-                print(f"Skipping invalid file path: {file_path}")
-                continue
-
-            current_date = extract_date_generic(os.path.basename(file_path))
-            if current_date is None:
-                print(f"Warning: Unable to extract date from file: {file_path}")
-                continue
-
-            try:
-                if str(file_path).endswith('.xz'):
-                    with lzma.open(file_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            try:
-                                prefix = row.get('IP Prefix') or row.get('ip_prefix')
-                                source_as = row.get('ASN') or row.get('asn')
-                                
-                                if prefix and source_as:
-                                    source_as = normalize_asn(str(source_as))
-                                    ip_network = ipaddress.ip_network(prefix, strict=False)
-                                    if isinstance(ip_network.network_address, ipaddress.IPv4Address):
-                                        prefix_length = ip_network.prefixlen
-                                        ip_prefix = ''.join(format(int(octet), '08b') for octet in ip_network.network_address.packed)
-                                        ip_prefix = ip_prefix[:prefix_length]
-                                        trie.insert(ip_prefix, source_as, 'RPKI', True, current_date, None)
-                                        prefix_count += 1
-                            except (ValueError, KeyError, AttributeError):
-                                pass
+def build_trie_from_roas(roa_files, trie: IPTrie, ip_version: int = 4):
+    """Parse RPKI ROA CSV / .csv.xz / TSV files into ModelTrie (preserving maxLength)."""
+    roa_count = 0
+    for fpath in roa_files:
+        fpath_str = str(fpath)
+        print(f"Processing ROA file: {fpath_str}")
+        try:
+            with _open_text(fpath_str) as fh:
+                first_line = fh.readline()
+                if not first_line:
+                    continue
+                fh.seek(0)
+                if "\t" in first_line and "," not in first_line:
+                    # TSV format: prefix \t maxlen \t asn
+                    for line in fh:
+                        parts = line.strip().split("\t")
+                        if len(parts) < 3:
+                            continue
+                        prefix, ml_str, asn_str = parts[0], parts[1], parts[2]
+                        if not _prefix_matches_version(prefix, ip_version):
+                            continue
+                        try:
+                            asn = normalize_asn(asn_str)
+                            ml = int(ml_str) if ml_str else ipaddress.ip_network(prefix, strict=False).prefixlen
+                            trie.insert(ip_prefix_to_bits(prefix), asn, "RPKI", True, max_length=ml)
+                            roa_count += 1
+                        except ValueError:
+                            continue
                 else:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            try:
-                                prefix = row.get('IP Prefix') or row.get('ip_prefix')
-                                source_as = row.get('ASN') or row.get('asn')
-                                
-                                if prefix and source_as:
-                                    source_as = normalize_asn(str(source_as))
-                                    ip_network = ipaddress.ip_network(prefix, strict=False)
-                                    if isinstance(ip_network.network_address, ipaddress.IPv4Address):
-                                        prefix_length = ip_network.prefixlen
-                                        ip_prefix = ''.join(format(int(octet), '08b') for octet in ip_network.network_address.packed)
-                                        ip_prefix = ip_prefix[:prefix_length]
-                                        trie.insert(ip_prefix, source_as, 'RPKI', True, current_date, None)
-                                        prefix_count += 1
-                            except (ValueError, KeyError, AttributeError):
-                                pass
-            except Exception as e:
-                print(f"Error reading ROA file {file_path}: {e}")
-                continue
-
-    print(f"Processed {len(file_group)} ROA files, total prefixes: {prefix_count}")
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        prefix = (
+                            row.get("IP Prefix")
+                            or row.get("ip_prefix")
+                            or row.get("Prefix")
+                            or row.get("prefix")
+                        )
+                        asn_str = row.get("ASN") or row.get("asn")
+                        ml_str = (
+                            row.get("Max Length")
+                            or row.get("max_length")
+                            or row.get("MaxLength")
+                            or row.get("maxlen")
+                        )
+                        if not prefix or not asn_str:
+                            continue
+                        if not _prefix_matches_version(prefix, ip_version):
+                            continue
+                        try:
+                            asn = normalize_asn(asn_str)
+                            net = ipaddress.ip_network(prefix, strict=False)
+                            ml = int(ml_str) if (ml_str and str(ml_str).strip()) else net.prefixlen
+                            trie.insert(ip_prefix_to_bits(prefix), asn, "RPKI", True, max_length=ml)
+                            roa_count += 1
+                        except ValueError:
+                            continue
+        except Exception as exc:
+            print(f"Warning: failed to read ROA file {fpath_str}: {exc}")
+    print(f"Processed {len(roa_files)} ROA file(s), total ROAs: {roa_count}")
     return trie
 
 
-def detect_file_encoding(file_path):
-    with open(file_path, 'rb') as file:
-        raw_data = file.read(1024)
-    result = chardet.detect(raw_data)
-    return result['encoding']
-
-
-def build_trie_from_irr(folder_path, trie):
+def build_trie_from_irr(folder_path, trie: IPTrie, ip_version: int = 4):
+    """Parse IRR RPSL (route/route6 + origin) or TSV files into ModelTrie."""
+    route_re = re.compile(r"^(route6?):\s*(\S+)", re.IGNORECASE)
+    origin_re = re.compile(r"^origin:\s*(AS\d+)", re.IGNORECASE)
     po_pairs = set()
-    route_pattern = re.compile(r'^(route6?):\s*(\S+)')
-    origin_pattern = re.compile(r'origin:\s*(AS\d+)', re.IGNORECASE)
 
-    for file_name in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, file_name)
-        if not os.path.isfile(file_path):
-            continue
+    folder = Path(folder_path)
+    files = [folder] if folder.is_file() else sorted(p for p in folder.iterdir() if p.is_file() and not p.name.startswith("."))
 
-        encoding = detect_file_encoding(file_path)
-        print(f"Processing IRR file: {file_path}")
+    for fpath in files:
+        print(f"Processing IRR file: {fpath}")
+        enc = _detect_encoding(fpath)
         try:
-            with open(file_path, 'r', encoding=encoding, errors='ignore') as file:
+            with _open_text(fpath, encoding=enc) as fh:
                 current_prefix = None
-                for line in file:
-                    line = line.strip()
-                    route_match = route_pattern.match(line)
-                    if route_match:
-                        current_prefix = route_match.group(2)
-                        continue
-
-                    origin_match = origin_pattern.match(line)
-                    if origin_match and current_prefix:
-                        asn = origin_match.group(1).upper()
-                        po_pairs.add((current_prefix, asn))
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line:
                         current_prefix = None
-        except Exception as e:
-            print(f"Error processing IRR file {file_path}: {e}")
+                        continue
+                    # Support pre-parsed TSV (prefix \t asn)
+                    if "\t" in line and not line.lower().startswith(("route", "origin")):
+                        parts = line.split("\t")
+                        if len(parts) >= 2:
+                            po_pairs.add((parts[0].strip(), parts[1].strip()))
+                        continue
+                    rm = route_re.match(line)
+                    if rm:
+                        current_prefix = rm.group(2)
+                        continue
+                    om = origin_re.match(line)
+                    if om and current_prefix:
+                        po_pairs.add((current_prefix, om.group(1)))
+                        current_prefix = None
+        except Exception as exc:
+            print(f"Warning: failed to process IRR file {fpath}: {exc}")
+
+    inserted = 0
+    for prefix, asn_str in po_pairs:
+        if not _prefix_matches_version(prefix, ip_version):
+            continue
+        try:
+            asn = normalize_asn(asn_str)
+            if is_private_asn(asn):
+                continue
+            net = ipaddress.ip_network(prefix, strict=False)
+            if net.prefixlen < trie.min_prefix_len:
+                continue
+            trie.insert(ip_prefix_to_bits(prefix), asn, "IRR", True)
+            inserted += 1
+        except ValueError:
             continue
 
-    for prefix, asn in po_pairs:
-        try:
-            ip_network = ipaddress.ip_network(prefix, strict=False)
-            if isinstance(ip_network, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
-                prefix_length = ip_network.prefixlen
-                if ip_network.version == 4:
-                    ip_bin = ''.join(f"{int(octet):08b}" for octet in ip_network.network_address.packed)
+    print(f"Processed {inserted} IRR P/O pairs from {len(files)} file(s)")
+    return trie
+
+
+def load_as_relationships(path):
+    """Load CAIDA AS relationships (a|b|-1 for provider->customer, a|b|0 for peer)."""
+    prov = set()
+    peer = set()
+    p = Path(path)
+    files = [p] if p.is_file() else sorted(f for f in p.iterdir() if f.is_file() and not f.name.startswith("."))
+    for fpath in files:
+        print(f"Loading AS relationships: {fpath}")
+        with _open_text(fpath) as fh:
+            for line in fh:
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.strip().split("|")
+                if len(parts) < 3:
+                    continue
+                try:
+                    a, b, rel = int(parts[0]), int(parts[1]), int(parts[2])
+                except ValueError:
+                    continue
+                if rel == -1:
+                    prov.add((a, b))
                 else:
-                    ip_bin = ''.join(f"{int(octet):08b}" for octet in ip_network.network_address.packed[:16])
-                ip_bin = ip_bin[:prefix_length]
-                asn = normalize_asn(asn)
-                trie.insert(ip_bin, asn, 'IRR', True, None, None)
-        except ValueError:
-            print(f"Invalid prefix: {prefix} (ASN: {asn})")
-
-    print(f"Processed {len(po_pairs)} P/O pairs from IRR data")
-    return trie
+                    peer.add((a, b))
+                    peer.add((b, a))
+    print(f"Loaded AS relationships: {len(prov)} p2c edges, {len(peer) // 2} p2p edges")
+    return {"prov": prov, "peer": peer}
 
 
-def group_files_by_date(folder_path):
-    date_to_files = defaultdict(list)
+def load_as_organizations(path):
+    """Load CAIDA as-org2info (.txt / .txt.gz) or pre-mapped TSV (asn\\torg_id\\tstem)."""
+    org = {}
+    oname = {}
+    stem = {}
+    p = Path(path)
+    files = [p] if p.is_file() else sorted(f for f in p.iterdir() if f.is_file() and not f.name.startswith("."))
 
-    for file in os.listdir(folder_path):
-        file_date = extract_date_generic(file)
-        if file_date:
-            date_to_files[file_date].append(os.path.join(folder_path, file))
+    for fpath in files:
+        print(f"Loading AS organizations: {fpath}")
+        mode = None
+        with _open_text(fpath) as fh:
+            for line in fh:
+                if line.startswith("# format:aut"):
+                    mode = "aut"
+                    continue
+                if line.startswith("# format:org"):
+                    mode = "org"
+                    continue
+                if line.startswith("#") or not line.strip():
+                    continue
+                if "|" in line:
+                    parts = line.strip().split("|")
+                    if mode == "aut" and len(parts) >= 4:
+                        try:
+                            org[int(parts[0])] = parts[3]
+                        except ValueError:
+                            continue
+                    elif mode == "org" and len(parts) >= 3:
+                        oname[parts[0]] = parts[2]
+                elif "\t" in line:
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 2:
+                        try:
+                            asn = int(parts[0])
+                        except ValueError:
+                            continue
+                        if parts[1] and parts[1] != "0":
+                            org[asn] = parts[1]
+                        if len(parts) >= 3 and parts[2] and parts[2] != "0":
+                            stem[asn] = parts[2]
 
-    sorted_dates = sorted(date_to_files.keys())
-    grouped_files = []
-    temp_group = []
+    for asn, oid in org.items():
+        if asn not in stem and oid in oname:
+            st = extract_org_stem(oname[oid])
+            if st:
+                stem[asn] = st
 
-    for i, current_date in enumerate(sorted_dates):
-        if not temp_group:
-            temp_group.append(current_date)
-        else:
-            if (current_date - temp_group[-1]).days == 1:
-                temp_group.append(current_date)
-            else:
-                if len(temp_group) >= 5:
-                    grouped_files.append([date_to_files[date] for date in temp_group])
-
-                temp_group = [current_date]
-
-        if len(temp_group) == 5:
-            grouped_files.append([date_to_files[date] for date in temp_group])
-            temp_group = []
-
-    if len(temp_group) >= 5:
-        grouped_files.append([date_to_files[date] for date in temp_group])
-
-    return grouped_files
-
-
-def build_single_trie(rib_group, roa_group, irr_folder, bgpdump_path=None):
-    trie = IPTrie()
-    trie = build_trie_from_roas(roa_group, trie)
-    trie = build_trie_from_ribs(rib_group, trie, bgpdump_path=bgpdump_path)
-    if os.path.isdir(irr_folder):
-        trie = build_trie_from_irr(irr_folder, trie)
-    return trie
-
-import gzip
-
-
-def load_single_rib_file(rib_file_path, bgpdump_path=None):
-    """Load a single RIB file (handles .gz compression)"""
-    if str(rib_file_path).endswith('.gz'):
-        with gzip.open(rib_file_path, 'rb') as f:
-            temp_path = str(rib_file_path).replace('.gz', '_temp')
-            with open(temp_path, 'wb') as temp_f:
-                temp_f.write(f.read())
-        result = build_trie_from_ribs([[temp_path]], IPTrie(), bgpdump_path=bgpdump_path)
-        os.remove(temp_path)
-        return result
-    else:
-        return build_trie_from_ribs([[str(rib_file_path)]], IPTrie(), bgpdump_path=bgpdump_path)
+    print(f"Loaded AS organizations: {len(org)} AS-org mappings, {len(stem)} name stems")
+    return {"org": org, "stem": stem}
 
 
-def load_roa_files_from_dir(roa_dir):
-    """Load all ROA files from a directory"""
-    roa_files = []
-    roa_dir = Path(roa_dir)
-    for file_path in roa_dir.glob('roas_*.csv*'):
-        roa_files.append(str(file_path))
-    return sorted(roa_files)
+def _collect_files(path_or_dir, patterns=None):
+    """Return sorted list of non-hidden files from a file path or directory."""
+    p = Path(path_or_dir)
+    if not p.exists():
+        return []
+    if p.is_file():
+        return [str(p)]
+    files = []
+    if patterns:
+        for pat in patterns:
+            files.extend(str(f) for f in p.glob(pat) if f.is_file())
+    if not files:
+        files = [str(f) for f in p.iterdir() if f.is_file() and not f.name.startswith(".")]
+    return sorted(set(files))
 
 
-def build_iptrie_from_real_data(rib_file=None, roa_dir=None, irr_dir=None, bgpdump_path=None):
-    """
-    Build IPTrie from real data sources.
-    
-    Args:
-        rib_file: Path to a single RIB file (e.g., rrc00_updates.20170105.1200.gz)
-        roa_dir: Directory containing ROA files (e.g., /mnt/data/afrinic-roa-24/)
-        irr_dir: Directory containing IRR files (e.g., /mnt/data/IRR/)
-        bgpdump_path: Path to bgpdump binary (default: /mnt/data/bgpd/bgpdump)
-    
-    Returns:
-        IPTrie object
-    """
-    trie = IPTrie()
+def build_iptrie_from_real_data(
+    rib_file=None,
+    roa_dir=None,
+    irr_dir=None,
+    as_rel_path=None,
+    as_org_path=None,
+    bgpdump_path=None,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+    ip_version: int = 4,
+):
+    """Build ModelTrie (IPTrie) from BGP RIB, RPKI ROA, IRR, AS-rel, and AS2Org sources."""
+    trie = IPTrie(window_days=window_days, ip_version=ip_version)
+
+    if as_rel_path and Path(as_rel_path).exists():
+        trie.set_as_relationships(load_as_relationships(as_rel_path))
+    elif as_rel_path:
+        print(f"Warning: AS relationship path not found: {as_rel_path}")
+
+    if as_org_path and Path(as_org_path).exists():
+        trie.set_as_organizations(load_as_organizations(as_org_path))
+    elif as_org_path:
+        print(f"Warning: AS organization path not found: {as_org_path}")
 
     if rib_file:
-        print(f"Loading RIB file: {rib_file}")
-        rib_file = Path(rib_file)
-        if rib_file.exists():
-            trie = load_single_rib_file(rib_file, bgpdump_path=bgpdump_path)
+        rib_files = _collect_files(rib_file)
+        if rib_files:
+            trie = build_trie_from_ribs(rib_files, trie, bgpdump_path=bgpdump_path, ip_version=ip_version)
         else:
-            print(f"Warning: RIB file not found: {rib_file}")
+            print(f"Warning: No RIB files found at: {rib_file}")
 
     if roa_dir:
-        print(f"Loading ROA files from: {roa_dir}")
-        roa_dir = Path(roa_dir)
-        if roa_dir.exists():
-            roa_files = load_roa_files_from_dir(roa_dir)
-            if roa_files:
-                roa_groups = [[f] for f in roa_files]
-                trie = build_trie_from_roas(roa_groups, trie)
-            else:
-                print(f"Warning: No ROA files found in {roa_dir}")
+        roa_files = _collect_files(roa_dir, patterns=("*.csv", "*.csv.xz", "*.tsv"))
+        if roa_files:
+            trie = build_trie_from_roas(roa_files, trie, ip_version=ip_version)
         else:
-            print(f"Warning: ROA directory not found: {roa_dir}")
+            print(f"Warning: No ROA files found at: {roa_dir}")
 
     if irr_dir:
-        print(f"Loading IRR files from: {irr_dir}")
-        irr_dir = Path(irr_dir)
-        if irr_dir.exists():
-            trie = build_trie_from_irr(str(irr_dir), trie)
+        if Path(irr_dir).exists():
+            trie = build_trie_from_irr(irr_dir, trie, ip_version=ip_version)
         else:
-            print(f"Warning: IRR directory not found: {irr_dir}")
+            print(f"Warning: IRR path not found: {irr_dir}")
 
     return trie
-

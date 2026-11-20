@@ -1,20 +1,8 @@
 # Python version: 3.8+
 
-# Core dependencies
+# Core optional dependency (automatic text encoding detection for raw IRR files)
 chardet>=4.0.0
 
-# Standard library modules (included with Python)
-# - json
-# - pickle
-# - statistics
-# - random
-# - math
-# - datetime
-# - pathlib
-# - argparse
-# - collections
-# - ipaddress
-# - re
-# - gzip
-# - csv
-# - lzma
+# All other modules come from the Python standard library:
+# argparse, bz2, collections, csv, datetime, gzip, ipaddress,
+# json, lzma, math, os, pathlib, pickle, random, re, shutil, subprocess
